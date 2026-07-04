@@ -19,6 +19,7 @@ import streamlit as st
 
 import db_utils
 import ai_providers
+from i18n import t, LANGUAGES, DEFAULT_LANGUAGE
 from init_db import main as run_init_db
 
 # --------------------------------------------------------------------------
@@ -40,6 +41,7 @@ if not os.path.exists(db_utils.DB_PATH):
 # --------------------------------------------------------------------------
 def init_session_state():
     defaults = {
+        "language": DEFAULT_LANGUAGE,   # 'en' | 'ja' — UI display language
         "exam_stage": "not_started",   # 'not_started' | 'in_progress' | 'submitted'
         "exam_questions": [],          # list[dict] snapshot of the questions for this attempt
         "user_answers": {},            # {question_id: 'A'/'B'/'C'/'D'/None}
@@ -65,6 +67,21 @@ def init_session_state():
 init_session_state()
 
 
+def render_language_selector():
+    """Language toggle shown at the very top of the sidebar, above everything else,
+    so switching languages immediately re-renders the whole app in the new language."""
+    codes = list(LANGUAGES.keys())
+    labels = list(LANGUAGES.values())
+    current_index = codes.index(st.session_state.language) if st.session_state.language in codes else 0
+    selected_label = st.sidebar.selectbox(
+        t("language_label"), labels, index=current_index, key="language_selector",
+    )
+    selected_code = codes[labels.index(selected_label)]
+    if selected_code != st.session_state.language:
+        st.session_state.language = selected_code
+        st.rerun()
+
+
 # --------------------------------------------------------------------------
 # Shared AI provider/model configuration widget
 # --------------------------------------------------------------------------
@@ -78,11 +95,11 @@ def render_ai_provider_selector(key_prefix: str):
     none selected yet. custom_path is only meaningful for Open WebUI.
     """
     provider = st.selectbox(
-        "Model Provider",
+        t("model_provider_label"),
         ai_providers.PROVIDERS,
         index=ai_providers.PROVIDERS.index(st.session_state.ai_provider),
         key=f"{key_prefix}_provider",
-        help="Use Anthropic's cloud API, or point at a local Ollama or Open WebUI instance.",
+        help=t("model_provider_help"),
     )
     st.session_state.ai_provider = provider
 
@@ -93,8 +110,8 @@ def render_ai_provider_selector(key_prefix: str):
     if ai_providers.provider_requires_base_url(provider):
         default_url = st.session_state.ai_base_url or ai_providers.default_base_url(provider)
         base_url = st.text_input(
-            "Base URL", value=default_url, key=f"{key_prefix}_base_url",
-            help="Address of your local Ollama / Open WebUI server.",
+            t("base_url_label"), value=default_url, key=f"{key_prefix}_base_url",
+            help=t("base_url_help"),
         )
         st.session_state.ai_base_url = base_url
 
@@ -102,22 +119,18 @@ def render_ai_provider_selector(key_prefix: str):
         placeholder = "sk-ant-..." if provider == ai_providers.PROVIDER_ANTHROPIC else "Open WebUI API key"
         env_hint = ""
         if provider == ai_providers.PROVIDER_ANTHROPIC and os.environ.get("ANTHROPIC_API_KEY"):
-            env_hint = " (ANTHROPIC_API_KEY is set in the environment — leave blank to use it)"
+            env_hint = t("api_key_env_hint")
         api_key = st.text_input(
-            f"API Key{env_hint}", value=st.session_state.ai_api_key, type="password",
+            f"{t('api_key_label')}{env_hint}", value=st.session_state.ai_api_key, type="password",
             key=f"{key_prefix}_api_key", placeholder=placeholder,
         )
         st.session_state.ai_api_key = api_key
 
     if provider == ai_providers.PROVIDER_OPENWEBUI:
-        with st.expander("⚙️ Advanced: Custom API Path"):
-            st.caption(
-                "By default we auto-try common Open WebUI chat-completions paths. If your "
-                "instance uses a nonstandard layout, or auto-detection fails, set the exact "
-                "path here (e.g. `/api/chat/completions`)."
-            )
+        with st.expander(t("advanced_custom_path")):
+            st.caption(t("custom_path_caption"))
             custom_path = st.text_input(
-                "Custom chat-completions path (optional)",
+                t("custom_path_label"),
                 value=st.session_state.ai_custom_path,
                 key=f"{key_prefix}_custom_path",
                 placeholder="/api/chat/completions",
@@ -127,15 +140,15 @@ def render_ai_provider_selector(key_prefix: str):
     col_model, col_refresh = st.columns([3, 1])
     with col_refresh:
         st.write("")  # vertical alignment spacer
-        fetch_clicked = st.button("🔄 Fetch Models", key=f"{key_prefix}_fetch_models")
+        fetch_clicked = st.button(t("fetch_models_button"), key=f"{key_prefix}_fetch_models")
 
     if fetch_clicked:
         try:
-            with st.spinner("Fetching available models..."):
+            with st.spinner(t("fetching_models_spinner")):
                 models = ai_providers.list_models(provider, base_url=base_url, api_key=api_key)
             st.session_state.ai_available_models = models
             if not models:
-                st.warning("No models were returned by this provider.")
+                st.warning(t("no_models_returned"))
         except RuntimeError as e:
             st.session_state.ai_available_models = []
             st.error(str(e))
@@ -144,14 +157,13 @@ def render_ai_provider_selector(key_prefix: str):
         available = st.session_state.ai_available_models
         if available:
             default_idx = available.index(st.session_state.ai_model) if st.session_state.ai_model in available else 0
-            model = st.selectbox("Model", available, index=default_idx, key=f"{key_prefix}_model_select")
+            model = st.selectbox(t("model_label"), available, index=default_idx, key=f"{key_prefix}_model_select")
         else:
             model = st.text_input(
-                "Model name",
+                t("model_name_label"),
                 value=st.session_state.ai_model,
                 key=f"{key_prefix}_model_text",
-                help="Click 'Fetch Models' to list available models, or type one directly "
-                     "(e.g. 'llama3:8b' for Ollama, 'claude-sonnet-5' for Anthropic).",
+                help=t("model_name_help"),
             )
         st.session_state.ai_model = model
 
@@ -227,28 +239,30 @@ def reset_exam():
 # UI: Sidebar navigation + exam configuration
 # --------------------------------------------------------------------------
 def render_sidebar():
-    st.sidebar.title("☁️ AWS Mock Exam Engine")
-    view = st.sidebar.radio(
-        "Navigation",
-        ["Take an Exam", "Admin Dashboard"],
+    render_language_selector()
+    st.sidebar.title(t("app_title"))
+    view_labels = [t("nav_take_exam"), t("nav_admin")]
+    view_label = st.sidebar.radio(
+        t("nav_label"),
+        view_labels,
         index=0,
-        help="Switch between practicing exams and managing the question bank.",
+        help=t("nav_help"),
     )
     st.sidebar.divider()
 
-    if view == "Take an Exam":
+    if view_label == t("nav_take_exam"):
         render_exam_config_sidebar()
 
-    return view
+    return "Admin Dashboard" if view_label == t("nav_admin") else "Take an Exam"
 
 
 def render_exam_config_sidebar():
     certifications = db_utils.get_certifications()
     if not certifications:
-        st.sidebar.warning("No certifications found in the database.")
+        st.sidebar.warning(t("no_certs_found"))
         return
 
-    st.sidebar.subheader("Exam Configuration")
+    st.sidebar.subheader(t("exam_config_header"))
 
     cert_labels = [f"{c['code']} — {c['name']}" for c in certifications]
     cert_lookup = {label: cert for label, cert in zip(cert_labels, certifications)}
@@ -262,34 +276,34 @@ def render_exam_config_sidebar():
                 break
 
     selected_label = st.sidebar.selectbox(
-        "Target Certification", cert_labels, index=default_index,
+        t("target_cert_label"), cert_labels, index=default_index,
         disabled=st.session_state.exam_stage == "in_progress",
     )
     selected_cert = dict(cert_lookup[selected_label])
     pool_size = db_utils.get_question_count(selected_cert["id"])
 
-    st.sidebar.caption(f"Level: **{selected_cert['level']}** | Pass mark: **{int(selected_cert['pass_threshold']*100)}%**")
-    st.sidebar.caption(f"Questions available in bank: **{pool_size}**")
+    st.sidebar.caption(t("level_pass_mark", level=selected_cert["level"], pct=int(selected_cert["pass_threshold"]*100)))
+    st.sidebar.caption(t("questions_in_bank", count=pool_size))
 
     st.sidebar.divider()
-    st.sidebar.markdown("**Question Source**")
+    st.sidebar.markdown(t("question_source_header"))
     source_choice = st.sidebar.radio(
-        "Question Source",
-        ["📚 Use Existing Question Bank", "🤖 Generate New with AI"],
+        t("question_source_header"),
+        [t("question_source_bank"), t("question_source_ai")],
         label_visibility="collapsed",
         disabled=st.session_state.exam_stage == "in_progress",
         key="exam_question_source",
     )
-    use_ai_generation = source_choice.startswith("🤖")
+    use_ai_generation = source_choice == t("question_source_ai")
 
     num_questions = 0
     ai_provider = ai_model = ai_base_url = ai_api_key = None
+    ai_custom_path = ""
     ai_exam_number = 1
 
     if not use_ai_generation:
         if pool_size == 0:
-            st.sidebar.error("This certification has no questions yet. Add some via the Admin Dashboard, "
-                              "or switch to 'Generate New with AI'.")
+            st.sidebar.error(t("no_questions_yet"))
             return
         max_q = min(pool_size, db_utils.MAX_QUESTIONS_PER_CERT)
         if max_q <= 1:
@@ -297,78 +311,72 @@ def render_exam_config_sidebar():
             # question is available we skip the slider entirely and just inform
             # the user that a single-question attempt will be generated.
             num_questions = max_q
-            st.sidebar.caption("Only 1 question available — it will be used as-is.")
+            st.sidebar.caption(t("only_one_question"))
         else:
             num_questions = st.sidebar.slider(
-                "Number of Questions",
+                t("num_questions_label"),
                 min_value=1,
                 max_value=max_q,
                 value=min(10, max_q),
                 disabled=st.session_state.exam_stage == "in_progress",
             )
     else:
-        st.sidebar.caption(
-            "A brand-new set of questions will be generated by your selected model and "
-            "saved to the local database before your exam begins."
-        )
-        with st.sidebar.expander("🔧 Model Provider Settings", expanded=True):
+        st.sidebar.caption(t("ai_gen_intro"))
+        with st.sidebar.expander(t("model_provider_settings"), expanded=True):
             ai_provider, ai_model, ai_base_url, ai_api_key, ai_custom_path = render_ai_provider_selector("examgen")
 
         room_left = max(0, db_utils.MAX_QUESTIONS_PER_CERT - pool_size)
         if room_left == 0:
-            st.sidebar.warning(
-                f"This certification's bank is already at the {db_utils.MAX_QUESTIONS_PER_CERT}-question "
-                "cap. Switch to 'Use Existing Question Bank' or add a new certification."
-            )
+            st.sidebar.warning(t("bank_full_switch", cap=db_utils.MAX_QUESTIONS_PER_CERT))
         else:
             sidebar_cap = min(room_left, 100)  # keep a single on-demand generation request reasonably sized
             num_questions = st.sidebar.slider(
-                "Number of NEW questions to generate",
+                t("num_new_questions_label"),
                 min_value=1, max_value=sidebar_cap, value=min(10, sidebar_cap),
                 disabled=st.session_state.exam_stage == "in_progress",
             )
             ai_exam_number = st.sidebar.number_input(
-                "Tag as Exam Set #", min_value=1, max_value=10, value=1,
+                t("tag_exam_set_label"), min_value=1, max_value=10, value=1,
                 disabled=st.session_state.exam_stage == "in_progress",
-                help="Which practice-exam slot these newly generated questions are filed under.",
+                help=t("tag_exam_set_help"),
             )
 
     timed_mode = st.sidebar.toggle(
-        "Timed Mode", value=False,
+        t("timed_mode_label"), value=False,
         disabled=st.session_state.exam_stage == "in_progress",
-        help="Impose a time limit on this practice attempt, mirroring real exam conditions.",
+        help=t("timed_mode_help"),
     )
     time_limit_minutes = st.session_state.time_limit_minutes
     if timed_mode:
         time_limit_minutes = st.sidebar.number_input(
-            "Time Limit (minutes)", min_value=5, max_value=240, value=90, step=5,
+            t("time_limit_label"), min_value=5, max_value=240, value=90, step=5,
             disabled=st.session_state.exam_stage == "in_progress",
         )
 
     st.sidebar.divider()
 
     if st.session_state.exam_stage == "in_progress":
-        st.sidebar.info("Exam in progress. Submit or reset to change configuration.")
-        if st.sidebar.button("🔁 Abandon & Reset Exam", use_container_width=True):
+        st.sidebar.info(t("exam_in_progress_info"))
+        if st.sidebar.button(t("abandon_reset_button"), use_container_width=True):
             reset_exam()
             st.rerun()
         return
 
-    button_label = "🤖 Generate & Start Exam" if use_ai_generation else "🚀 Start Exam"
+    button_label = t("generate_start_button") if use_ai_generation else t("start_exam_button")
     button_disabled = use_ai_generation and num_questions == 0
     if st.sidebar.button(button_label, type="primary", use_container_width=True, disabled=button_disabled):
         if use_ai_generation:
             if not ai_model:
-                st.sidebar.error("Please select or enter a model before generating.")
+                st.sidebar.error(t("select_model_first"))
                 return
             try:
-                progress_bar = st.sidebar.progress(0, text="Starting generation...")
+                progress_bar = st.sidebar.progress(0, text=t("starting_generation"))
 
                 def _update_progress(done, total):
                     pct = done / total if total else 1.0
-                    progress_bar.progress(min(pct, 1.0), text=f"{done} / {total} generated...")
+                    progress_bar.progress(min(pct, 1.0), text=t("progress_generated", done=done, total=total))
 
-                with st.spinner("Generating your exam with AI..."):
+                with st.spinner(t("generating_exam_spinner")):
                     result = db_utils.generate_questions_with_ai(
                         cert=selected_cert,
                         num_questions=num_questions,
@@ -381,13 +389,12 @@ def render_exam_config_sidebar():
                         progress_callback=_update_progress,
                     )
                 if not result["inserted_questions"]:
-                    err_preview = "; ".join(result["errors"][:2]) or "No questions were returned by the model."
-                    st.sidebar.error(f"Generation failed: {err_preview}")
+                    err_preview = "; ".join(result["errors"][:2]) or t("no_questions_returned")
+                    st.sidebar.error(t("generation_failed", detail=err_preview))
                 else:
                     if result["errors"]:
                         st.sidebar.warning(
-                            f"Generated {len(result['inserted_questions'])} question(s), with "
-                            f"{len(result['errors'])} issue(s) along the way."
+                            t("generated_with_issues", count=len(result["inserted_questions"]), issues=len(result["errors"]))
                         )
                     start_exam(
                         selected_cert, len(result["inserted_questions"]), timed_mode, time_limit_minutes,
@@ -405,27 +412,14 @@ def render_exam_config_sidebar():
 # UI: Exam taking screen
 # --------------------------------------------------------------------------
 def render_not_started():
-    st.title("☁️ AWS Certification Mock Exam Engine")
-    st.markdown(
-        """
-        Welcome! This tool lets you practice for AWS certification exams using a
-        customizable question bank stored locally in SQLite.
-
-        **How to begin:**
-        1. Use the sidebar to choose your target certification.
-        2. Pick how many questions you'd like to attempt.
-        3. Optionally enable **Timed Mode** to simulate real exam pressure.
-        4. Click **Start Exam**.
-
-        ---
-        """
-    )
+    st.title(t("app_title"))
+    st.markdown(t("welcome_body"))
     summary = db_utils.get_question_counts_all()
-    st.subheader("Question Bank Overview")
+    st.subheader(t("question_bank_overview"))
     cols = st.columns(len(summary)) if summary else []
     for col, row in zip(cols, summary):
         with col:
-            st.metric(row["code"], f"{row['question_count']} Qs", help=row["name"])
+            st.metric(row["code"], t("qs_suffix", count=row["question_count"]), help=row["name"])
 
 
 def format_duration(total_seconds: int) -> str:
@@ -454,34 +448,31 @@ def render_timer():
     if st.session_state.timed_mode:
         remaining = st.session_state.time_limit_minutes * 60 - elapsed
         if remaining <= 0:
-            st.error("⏰ Time's up! Auto-submitting your exam.")
+            st.error(t("time_up_autosubmit"))
             grade_exam()
             st.rerun()
             return
-        st.info(
-            f"⏳ Time remaining: **{format_duration(remaining)}**  "
-            f"&nbsp;|&nbsp;  ⏱️ Time elapsed: **{format_duration(elapsed)}**"
-        )
+        st.info(t("time_remaining_elapsed", remaining=format_duration(remaining), elapsed=format_duration(elapsed)))
     else:
-        st.info(f"⏱️ Time elapsed: **{format_duration(elapsed)}**")
+        st.info(t("time_elapsed_only", elapsed=format_duration(elapsed)))
 
 
 def render_in_progress():
     cert = st.session_state.exam_cert
     questions = st.session_state.exam_questions
-    st.title(f"{cert['code']} Practice Exam")
+    st.title(t("practice_exam_title", code=cert["code"]))
     st.caption(cert["name"])
 
     render_timer()
 
     answered = sum(1 for v in st.session_state.user_answers.values() if v is not None)
     st.progress(answered / len(questions) if questions else 0,
-                text=f"{answered} / {len(questions)} answered")
+                text=t("answered_progress", answered=answered, total=len(questions)))
 
     with st.form("exam_form", clear_on_submit=False):
         option_labels = {"A": "A", "B": "B", "C": "C", "D": "D"}
         for idx, q in enumerate(questions, start=1):
-            st.markdown(f"**Question {idx}.** {q['question_text']}")
+            st.markdown(t("question_number", num=idx, text=q["question_text"]))
             choice_display = [
                 f"A. {q['option_a']}",
                 f"B. {q['option_b']}",
@@ -492,7 +483,7 @@ def render_in_progress():
             current_idx = "ABCD".index(current) if current in option_labels else None
 
             selected = st.radio(
-                label=f"Select an answer for Question {idx}",
+                label=t("select_answer_for", num=idx),
                 options=choice_display,
                 index=current_idx,
                 key=f"radio_{q['id']}",
@@ -502,16 +493,12 @@ def render_in_progress():
             st.session_state.user_answers[q["id"]] = selected[0] if selected else None
             st.divider()
 
-        submitted = st.form_submit_button("✅ Submit Exam", type="primary", use_container_width=True)
+        submitted = st.form_submit_button(t("submit_exam_button"), type="primary", use_container_width=True)
 
     if submitted:
         unanswered = [i + 1 for i, q in enumerate(questions) if st.session_state.user_answers.get(q["id"]) is None]
         if unanswered:
-            st.warning(
-                f"You have {len(unanswered)} unanswered question(s): "
-                f"{', '.join(map(str, unanswered))}. You may still submit — "
-                "unanswered questions will be marked incorrect."
-            )
+            st.warning(t("unanswered_warning", count=len(unanswered), list=", ".join(map(str, unanswered))))
         grade_exam()
         st.rerun()
 
@@ -525,29 +512,23 @@ def render_submitted():
     questions = st.session_state.exam_questions
     answers = st.session_state.user_answers
 
-    st.title(f"{cert['code']} — Results")
+    st.title(t("results_title", code=cert["code"]))
 
     if summary["passed"]:
-        st.success(
-            f"### ✅ PASS — {summary['score_pct']*100:.1f}% "
-            f"(Required: {summary['threshold']*100:.0f}%)"
-        )
+        st.success(t("pass_banner", pct=summary["score_pct"]*100, threshold=summary["threshold"]*100))
     else:
-        st.error(
-            f"### ❌ FAIL — {summary['score_pct']*100:.1f}% "
-            f"(Required: {summary['threshold']*100:.0f}%)"
-        )
+        st.error(t("fail_banner", pct=summary["score_pct"]*100, threshold=summary["threshold"]*100))
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Correct", summary["correct"])
-    c2.metric("Incorrect", summary["incorrect"])
-    c3.metric("Unanswered", summary["unanswered"])
-    c4.metric("Total", summary["total"])
-    c5.metric("⏱️ Time Taken", format_duration(summary.get("elapsed_seconds", 0)))
+    c1.metric(t("metric_correct"), summary["correct"])
+    c2.metric(t("metric_incorrect"), summary["incorrect"])
+    c3.metric(t("metric_unanswered"), summary["unanswered"])
+    c4.metric(t("metric_total"), summary["total"])
+    c5.metric(t("metric_time_taken"), format_duration(summary.get("elapsed_seconds", 0)))
 
     st.divider()
-    st.subheader("📝 Review Mode")
-    st.caption("Expand each question to see your answer versus the correct answer and the full rationale.")
+    st.subheader(t("review_mode_header"))
+    st.caption(t("review_mode_caption"))
 
     option_map = {"A": "option_a", "B": "option_b", "C": "option_c", "D": "option_d"}
 
@@ -557,28 +538,28 @@ def render_submitted():
         is_correct = user_choice == correct_choice
         icon = "✅" if is_correct else ("⚪" if user_choice is None else "❌")
 
-        with st.expander(f"{icon} Question {idx}: {q['question_text'][:90]}..."):
+        with st.expander(f"{icon} " + t("question_expander", num=idx, preview=q["question_text"][:90])):
             st.markdown(f"**{q['question_text']}**")
             st.write("")
             for opt_key, field in option_map.items():
                 text = q[field]
                 prefix = f"**{opt_key}.** {text}"
                 if opt_key == correct_choice:
-                    st.markdown(f"🟢 {prefix}  *(Correct Answer)*")
+                    st.markdown(f"🟢 {prefix}  {t('correct_answer_tag')}")
                 elif opt_key == user_choice:
-                    st.markdown(f"🔴 {prefix}  *(Your Answer)*")
+                    st.markdown(f"🔴 {prefix}  {t('your_answer_tag')}")
                 else:
                     st.markdown(f"{prefix}")
 
             if user_choice is None:
-                st.warning("You did not answer this question.")
+                st.warning(t("did_not_answer"))
 
-            st.info(f"**Explanation:** {q['explanation']}")
+            st.info(t("explanation_label", text=q["explanation"]))
             if q.get("domain"):
-                st.caption(f"Domain: {q['domain']}")
+                st.caption(t("domain_label", domain=q["domain"]))
 
     st.divider()
-    if st.button("🔁 Start a New Exam", type="primary"):
+    if st.button(t("start_new_exam_button"), type="primary"):
         reset_exam()
         st.rerun()
 
@@ -587,18 +568,18 @@ def render_submitted():
 # UI: Admin Dashboard
 # --------------------------------------------------------------------------
 def render_admin_dashboard():
-    st.title("🛠️ Admin Dashboard")
-    st.caption("Manage the question bank: review counts, add questions manually, or batch-import new exams.")
+    st.title(t("admin_title"))
+    st.caption(t("admin_caption"))
 
     tab_overview, tab_manual, tab_batch, tab_ai, tab_new_cert = st.tabs(
-        ["📊 Overview", "➕ Add Question", "📁 Batch Import", "🤖 AI Question Generator", "🏷️ Add Certification"]
+        [t("tab_overview"), t("tab_add_question"), t("tab_batch_import"), t("tab_ai_generator"), t("tab_add_cert")]
     )
 
     certifications = db_utils.get_certifications()
 
     # --- Overview ---
     with tab_overview:
-        st.subheader("Question Counts per Certification")
+        st.subheader(t("question_counts_header"))
         summary = db_utils.get_question_counts_all()
         if summary:
             st.dataframe(
@@ -606,66 +587,60 @@ def render_admin_dashboard():
                 use_container_width=True,
                 column_config={
                     "id": None,
-                    "code": "Code",
-                    "name": "Certification",
-                    "level": "Level",
-                    "question_count": "Question Count",
-                    "cap": "Max Bank Size",
+                    "code": t("col_code"),
+                    "name": t("col_certification"),
+                    "level": t("col_level"),
+                    "question_count": t("col_question_count"),
+                    "cap": t("col_max_bank_size"),
                 },
                 hide_index=True,
             )
 
             st.divider()
-            st.subheader("🧹 Deduplicate Database")
-            st.caption(
-                f"Scans every certification's question bank and removes near-duplicate questions "
-                f"(≥{int(db_utils.DUPLICATE_SIMILARITY_THRESHOLD*100)}% text-similarity to another "
-                "question in the same bank), keeping the earliest-added copy of each. New questions "
-                "are already checked automatically on the way in — use this to clean up anything "
-                "that predates that check, or that was imported before deduplication was enabled."
-            )
-            if st.button("🧹 Scan & Remove Duplicates (All Certifications)"):
-                with st.spinner("Scanning for near-duplicate questions..."):
+            st.subheader(t("dedup_header"))
+            st.caption(t("dedup_caption", pct=int(db_utils.DUPLICATE_SIMILARITY_THRESHOLD*100)))
+            if st.button(t("dedup_button")):
+                with st.spinner(t("dedup_scanning")):
                     results = db_utils.deduplicate_all_certifications()
                 total_removed = sum(r["removed"] for r in results.values())
                 if total_removed == 0:
-                    st.success("No near-duplicate questions found. Your question bank is clean.")
+                    st.success(t("dedup_none_found"))
                 else:
-                    st.success(f"Removed {total_removed} near-duplicate question(s) across all certifications.")
+                    st.success(t("dedup_removed_summary", count=total_removed))
                     for code, r in results.items():
                         if r["removed"]:
-                            st.text(f"  • {code}: removed {r['removed']}, kept {r['kept']}")
+                            st.text(t("dedup_removed_line", code=code, removed=r["removed"], kept=r["kept"]))
         else:
-            st.info("No certifications found. Run init_db.py to seed the database.")
+            st.info(t("no_certs_init_db"))
 
     # --- Manual add ---
     with tab_manual:
-        st.subheader("Add a New Question")
+        st.subheader(t("add_question_header"))
         if not certifications:
-            st.warning("No certifications available. Initialize the database first.")
+            st.warning(t("no_certs_init_first"))
         else:
             cert_labels = [f"{c['code']} — {c['name']}" for c in certifications]
             cert_lookup = {label: cert for label, cert in zip(cert_labels, certifications)}
 
             with st.form("add_question_form", clear_on_submit=True):
-                cert_label = st.selectbox("Certification", cert_labels)
+                cert_label = st.selectbox(t("certification_label"), cert_labels)
                 exam_number = st.number_input(
-                    "Exam Set # (1-10)", min_value=1, max_value=10, value=1,
-                    help="Which full-length practice exam this question belongs to.",
+                    t("exam_set_label"), min_value=1, max_value=10, value=1,
+                    help=t("exam_set_help"),
                 )
-                question_text = st.text_area("Question Text", height=100)
+                question_text = st.text_area(t("question_text_label"), height=100)
                 col_a, col_b = st.columns(2)
                 with col_a:
-                    option_a = st.text_input("Option A")
-                    option_c = st.text_input("Option C")
+                    option_a = st.text_input(t("option_a_label"))
+                    option_c = st.text_input(t("option_c_label"))
                 with col_b:
-                    option_b = st.text_input("Option B")
-                    option_d = st.text_input("Option D")
-                correct_option = st.selectbox("Correct Option", ["A", "B", "C", "D"])
-                explanation = st.text_area("Explanation / Rationale", height=100)
-                domain = st.text_input("Domain (optional)")
+                    option_b = st.text_input(t("option_b_label"))
+                    option_d = st.text_input(t("option_d_label"))
+                correct_option = st.selectbox(t("correct_option_label"), ["A", "B", "C", "D"])
+                explanation = st.text_area(t("explanation_field_label"), height=100)
+                domain = st.text_input(t("domain_optional_label"))
 
-                add_submitted = st.form_submit_button("Add Question", type="primary")
+                add_submitted = st.form_submit_button(t("add_question_button"), type="primary")
 
             if add_submitted:
                 cert = cert_lookup[cert_label]
@@ -682,123 +657,101 @@ def render_admin_dashboard():
                         exam_number=int(exam_number),
                         domain=domain.strip() or None,
                     )
-                    st.success(f"Question added to {cert['code']} (Exam Set {exam_number}).")
+                    st.success(t("question_added_success", code=cert["code"], exam_number=exam_number))
                 except ValueError as e:
-                    st.error(f"Could not add question: {e}")
+                    st.error(t("could_not_add_question", error=str(e)))
 
     # --- Batch import ---
     with tab_batch:
-        st.subheader("Batch Import Questions (CSV or JSON)")
-        st.markdown(
-            """
-            Upload a `.csv` or `.json` file containing multiple questions. Each record must
-            include the following fields:
-
-            `question_text, option_a, option_b, option_c, option_d, correct_option, explanation`
-
-            Optional fields: `exam_number` (defaults to 1), `domain`.
-            """
-        )
+        st.subheader(t("batch_import_header"))
+        st.markdown(t("batch_import_instructions"))
         if not certifications:
-            st.warning("No certifications available. Initialize the database first.")
+            st.warning(t("no_certs_init_first"))
         else:
             cert_labels = [f"{c['code']} — {c['name']}" for c in certifications]
             cert_lookup = {label: cert for label, cert in zip(cert_labels, certifications)}
-            target_label = st.selectbox("Target Certification for this import", cert_labels, key="batch_cert")
+            target_label = st.selectbox(t("target_cert_import_label"), cert_labels, key="batch_cert")
             target_cert = cert_lookup[target_label]
 
-            uploaded_file = st.file_uploader("Upload CSV or JSON", type=["csv", "json"])
+            uploaded_file = st.file_uploader(t("upload_file_label"), type=["csv", "json"])
 
             if uploaded_file is not None:
                 try:
                     records = db_utils.parse_uploaded_file(uploaded_file.getvalue(), uploaded_file.name)
-                    st.write(f"Parsed **{len(records)}** record(s) from `{uploaded_file.name}`.")
+                    st.write(t("parsed_records", count=len(records), filename=uploaded_file.name))
                     st.dataframe(records[:5], use_container_width=True)
-                    st.caption("Preview of first 5 records.")
+                    st.caption(t("preview_first_5"))
 
-                    if st.button("Confirm & Import", type="primary"):
+                    if st.button(t("confirm_import_button"), type="primary"):
                         result = db_utils.batch_import_questions(target_cert["id"], records)
-                        st.success(f"Imported {result['inserted']} question(s) into {target_cert['code']}.")
+                        st.success(t("imported_success", count=result["inserted"], code=target_cert["code"]))
                         if result.get("duplicates_skipped"):
                             st.info(
-                                f"Skipped {result['duplicates_skipped']} row(s) as near-duplicates "
-                                f"(≥{int(db_utils.DUPLICATE_SIMILARITY_THRESHOLD*100)}% similar to an "
-                                "existing question)."
+                                t("skipped_duplicates_info",
+                                  count=result["duplicates_skipped"],
+                                  pct=int(db_utils.DUPLICATE_SIMILARITY_THRESHOLD*100))
                             )
                         other_errors = [e for e in result["errors"] if "near-duplicate" not in e]
                         if other_errors:
-                            st.warning(f"{len(other_errors)} row(s) failed for other reasons:")
+                            st.warning(t("rows_failed_other", count=len(other_errors)))
                             for err in other_errors:
                                 st.text(f"  • {err}")
                 except Exception as e:  # noqa: BLE001 - surfaced directly to the admin user
-                    st.error(f"Failed to parse file: {e}")
+                    st.error(t("failed_to_parse", error=str(e)))
 
     # --- AI question generator ---
     with tab_ai:
-        st.subheader("Dynamically Generate Questions with AI")
-        st.markdown(
-            f"""
-            Generate realistic, scenario-based practice questions on demand using
-            Anthropic's cloud API, or a **local Ollama / Open WebUI** instance — no
-            data leaves your machine with the local options. Each certification's
-            question bank can hold up to **{db_utils.MAX_QUESTIONS_PER_CERT} questions**,
-            enough for roughly 10 full-length practice exams. Generated questions are
-            saved to the local SQLite database immediately.
-            """
-        )
+        st.subheader(t("ai_generator_subheader"))
+        st.markdown(t("ai_generator_intro", cap=db_utils.MAX_QUESTIONS_PER_CERT))
 
         if not certifications:
-            st.warning("No certifications available. Initialize the database first.")
+            st.warning(t("no_certs_init_first"))
         else:
-            with st.expander("🔧 Model Provider Settings", expanded=True):
+            with st.expander(t("model_provider_settings"), expanded=True):
                 ai_provider, ai_model, ai_base_url, ai_api_key, ai_custom_path = render_ai_provider_selector("admin_gen")
 
             cert_labels = [f"{c['code']} — {c['name']}" for c in certifications]
             cert_lookup = {label: cert for label, cert in zip(cert_labels, certifications)}
-            gen_label = st.selectbox("Certification", cert_labels, key="ai_gen_cert")
+            gen_label = st.selectbox(t("certification_label"), cert_labels, key="ai_gen_cert")
             gen_cert = dict(cert_lookup[gen_label])
 
             current_count = db_utils.get_question_count(gen_cert["id"])
             room_left = max(0, db_utils.MAX_QUESTIONS_PER_CERT - current_count)
-            st.caption(
-                f"Current bank size: **{current_count}** / {db_utils.MAX_QUESTIONS_PER_CERT} "
-                f"(**{room_left}** slot(s) remaining)"
-            )
+            st.caption(t("bank_size_caption", current=current_count, cap=db_utils.MAX_QUESTIONS_PER_CERT, room=room_left))
 
             col1, col2 = st.columns(2)
             with col1:
                 exam_number = st.number_input(
-                    "Exam Set # (1-10) to tag these questions with",
+                    t("exam_set_tag_label"),
                     min_value=1, max_value=10, value=1, key="ai_gen_exam_number",
                 )
             with col2:
                 batch_size = st.selectbox(
-                    "Batch size per model call", [5, 10, 15, 20], index=1,
-                    help="Larger batches are faster but slightly more likely to hit output limits, "
-                         "especially on smaller local models.",
+                    t("batch_size_label"), [5, 10, 15, 20], index=1,
+                    help=t("batch_size_help"),
                 )
 
             if room_left == 0:
-                st.info("This certification's question bank is already full.")
+                st.info(t("bank_already_full"))
             else:
                 num_to_generate = st.slider(
-                    "Number of questions to generate",
+                    t("num_to_generate_label"),
                     min_value=1, max_value=room_left, value=min(20, room_left),
                 )
                 est_calls = -(-num_to_generate // batch_size)  # ceil division
-                st.caption(f"This will make approximately {est_calls} model call(s).")
+                st.caption(t("approx_calls_caption", count=est_calls))
 
-                if st.button("🚀 Generate Questions", type="primary"):
+                if st.button(t("generate_button"), type="primary"):
                     if not ai_model:
-                        st.error("Please select or enter a model above (use 'Fetch Models' or type one in).")
+                        st.error(t("select_model_first"))
                     else:
-                        progress_bar = st.progress(0, text="Starting generation...")
+                        progress_bar = st.progress(0, text=t("starting_generation"))
 
                         def _update_progress(done, total):
                             pct = done / total if total else 1.0
-                            progress_bar.progress(min(pct, 1.0), text=f"{done} / {total} questions generated...")
+                            progress_bar.progress(min(pct, 1.0), text=t("progress_generated", done=done, total=total))
 
-                        with st.spinner(f"Generating questions via {ai_provider}..."):
+                        with st.spinner(t("generating_via_spinner", provider=ai_provider)):
                             try:
                                 result = db_utils.generate_questions_with_ai(
                                     cert=gen_cert,
@@ -812,15 +765,15 @@ def render_admin_dashboard():
                                     batch_size=int(batch_size),
                                     progress_callback=_update_progress,
                                 )
-                                progress_bar.progress(1.0, text="Done.")
+                                progress_bar.progress(1.0, text=t("done_progress"))
                                 st.success(
-                                    f"Inserted {result['inserted']} new question(s) into {gen_cert['code']} "
-                                    f"across {result['batches_run']} batch(es). Saved to the local database."
+                                    t("inserted_success", inserted=result["inserted"], code=gen_cert["code"],
+                                      batches=result["batches_run"])
                                 )
                                 if result["duplicates_skipped"]:
-                                    st.info(f"Skipped {result['duplicates_skipped']} likely-duplicate question(s).")
+                                    st.info(t("skipped_dup_info", count=result["duplicates_skipped"]))
                                 if result["errors"]:
-                                    st.warning(f"{len(result['errors'])} issue(s) encountered:")
+                                    st.warning(t("issues_encountered", count=len(result["errors"])))
                                     for err in result["errors"]:
                                         st.text(f"  • {err}")
                             except RuntimeError as e:
@@ -828,30 +781,26 @@ def render_admin_dashboard():
 
     # --- Add certification ---
     with tab_new_cert:
-        st.subheader("Add a New Certification")
-        st.caption(
-            "Not just the five built-in AWS certifications — add any certification you'd "
-            "like to build a question bank for. It will immediately appear in the exam "
-            "selection dropdown."
-        )
+        st.subheader(t("add_cert_header"))
+        st.caption(t("add_cert_caption"))
 
         with st.form("add_certification_form", clear_on_submit=True):
             new_code = st.text_input(
-                "Certification Code", placeholder="e.g. SAA-C03",
-                help="Short unique identifier: letters, numbers, and hyphens only.",
+                t("cert_code_label"), placeholder="e.g. SAA-C03",
+                help=t("cert_code_help"),
             )
             new_name = st.text_input(
-                "Full Certification Name",
+                t("cert_name_label"),
                 placeholder="e.g. AWS Certified Solutions Architect – Associate",
             )
             col_a, col_b = st.columns(2)
             with col_a:
-                new_level = st.selectbox("Level", db_utils.VALID_LEVELS)
+                new_level = st.selectbox(t("level_label"), db_utils.VALID_LEVELS)
             with col_b:
                 new_threshold_pct = st.number_input(
-                    "Pass Threshold (%)", min_value=1, max_value=100, value=72,
+                    t("pass_threshold_label"), min_value=1, max_value=100, value=72,
                 )
-            cert_submitted = st.form_submit_button("Add Certification", type="primary")
+            cert_submitted = st.form_submit_button(t("add_cert_button"), type="primary")
 
         if cert_submitted:
             try:
@@ -861,13 +810,9 @@ def render_admin_dashboard():
                     level=new_level,
                     pass_threshold=new_threshold_pct / 100.0,
                 )
-                st.success(
-                    f"Added certification '{new_name}' ({new_code.strip().upper()}). "
-                    "It now appears in the exam dropdown — add questions to it via the "
-                    "tabs above."
-                )
+                st.success(t("cert_added_success", name=new_name, code=new_code.strip().upper()))
             except ValueError as e:
-                st.error(f"Could not add certification: {e}")
+                st.error(t("could_not_add_cert", error=str(e)))
 
 
 # --------------------------------------------------------------------------
