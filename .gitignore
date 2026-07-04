@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# Dependencies & Package Managers
+# ---------------------------------------------------------------------------
+node_modules/               # Node.js dependencies
+/vendor/                    # PHP Composer or Go dependencies
+.venv/                      # Python virtual environments
+venv/                        # Alternate Python virtual environments
+env/                        # Alternate Python virtual environments
+.streamlit/
+
+# ---------------------------------------------------------------------------
+# Build Outputs & Compiled Code
+# ---------------------------------------------------------------------------
+dist/                       # Production build outputs
+build/                      # Compiled build folders
+out/                        # IDE or compiler build destinations
+*.exe                       # Executable binaries
+*.dll                       # Dynamic link libraries
+*.so                        # Shared object files
+*.class                     # Compiled Java files
+*.pyc                       # Compiled Python bytecode
+
+# ---------------------------------------------------------------------------
+# Environment Variables & Secrets (CRITICAL for Security)
+# ---------------------------------------------------------------------------
+.env                        # Local environment secrets
+.env.local                  # Local overrides
+*.pem                       # Private security keys
+credentials.json            # Sensitive API access tokens
+
+# ---------------------------------------------------------------------------
+# Logs and Databases
+# ---------------------------------------------------------------------------
+*.log                       # System, server, or execution logs
+npm-debug.log*              # Specific Node package manager crash logs
+*.sqlite                    # SQLite database files
+
+# ---------------------------------------------------------------------------
+# IDE, Code Editor, & Tool Configurations
+# ---------------------------------------------------------------------------
+.vscode/                    # Visual Studio Code workspace settings
+.idea/                      # JetBrains IntelliJ, WebStorm, PyCharm files
+*.suo                       # Visual Studio user options
+*.swp                       # Vim swap files
+
+# ---------------------------------------------------------------------------
+# Operating System Junk Files
+# ---------------------------------------------------------------------------
+.DS_Store                   # macOS file attributes cache
+Thumbs.db                   # Windows thumbnail cache
+
