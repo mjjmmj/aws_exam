@@ -26,8 +26,18 @@ DB_PATH = "aws_exams.db"
 # A candidate question is rejected if it's at or above this similarity ratio
 # (difflib SequenceMatcher, 0.0-1.0) to any already-banked question for the
 # same certification. This blocks exact duplicates as well as closely
-# paraphrased near-duplicates.
-DUPLICATE_SIMILARITY_THRESHOLD = 0.90
+# paraphrased near-duplicates. Configurable per-operation up to 1.0 (100%),
+# where 100% means "don't reject anything — keep even complete duplicates."
+DUPLICATE_SIMILARITY_THRESHOLD = 0.98
+MIN_SIMILARITY_THRESHOLD = 0.50
+MAX_SIMILARITY_THRESHOLD = 1.00
+
+# Independent of whatever storage-level threshold an admin configures (which can be
+# relaxed all the way to 100% to intentionally allow duplicates into the bank), a
+# single EXAM must never present the same or a near-identical question twice. This
+# fixed threshold is used only when assembling an exam's question set and is not
+# exposed as a user-configurable setting.
+EXAM_DEDUP_THRESHOLD = 0.98
 
 
 class DuplicateQuestionError(ValueError):
@@ -45,13 +55,24 @@ def _normalize_text(text: str) -> str:
 
 
 def _load_existing_normalized_texts(
-    cert_id: int, db_path: str = DB_PATH, exclude_id: Optional[int] = None
+    cert_id: int, db_path: str = DB_PATH, exclude_id: Optional[int] = None, language: Optional[str] = None
 ) -> list:
-    """Fetch [(id, normalized_text), ...] for every question banked under a certification."""
+    """
+    Fetch [(id, normalized_text), ...] for questions banked under a certification.
+    If `language` is given, only questions in that language are considered — comparing
+    across languages for duplicate-detection purposes doesn't make sense (the text will
+    naturally differ) and would waste comparison time.
+    """
     with get_connection(db_path) as conn:
-        rows = conn.execute(
-            "SELECT id, question_text FROM questions WHERE cert_id = ?", (cert_id,)
-        ).fetchall()
+        if language:
+            rows = conn.execute(
+                "SELECT id, question_text FROM questions WHERE cert_id = ? AND language = ?",
+                (cert_id, language),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, question_text FROM questions WHERE cert_id = ?", (cert_id,)
+            ).fetchall()
     return [(r["id"], _normalize_text(r["question_text"])) for r in rows if r["id"] != exclude_id]
 
 
@@ -65,11 +86,20 @@ def find_near_duplicate(
     Returns (matching_id, similarity_ratio) for the first match at/above `threshold`,
     or None if no near-duplicate is found.
 
+    A `threshold` of 1.0 (100%) disables duplicate detection entirely — every
+    candidate is treated as unique, so even exact, complete duplicates are allowed
+    through. This is the single choke point all higher-level dedup logic in this
+    module routes through, so setting 100% anywhere (batch import, AI generation,
+    manual add, or the cleanup tool) consistently means "keep complete duplicates."
+
     Uses difflib.SequenceMatcher for a robust text-similarity score (catches exact
     duplicates, minor rewording, and reordered-but-equivalent phrasing), with two
     cheap pre-filters — a length-ratio check and quick_ratio() — so the expensive
     exact ratio() computation only runs on plausible candidates.
     """
+    if threshold >= 1.0:
+        return None
+
     norm_target = _normalize_text(question_text)
     if not norm_target:
         return None
@@ -96,33 +126,60 @@ def find_near_duplicate(
     return None
 
 
+def deduplicate_question_list(questions: list, threshold: float = EXAM_DEDUP_THRESHOLD) -> list:
+    """
+    Given a list of question dicts (e.g. an assembled exam attempt), return a new list
+    with any pairwise near-duplicates removed, keeping the first occurrence of each
+    group. This is the final safety net applied when assembling a single exam so it
+    never shows the same or a near-identical question twice — independent of, and in
+    addition to, whatever similarity threshold was used when the questions were
+    originally stored (which may have been relaxed to 100% to intentionally allow
+    duplicates into the bank for other purposes).
+    """
+    kept = []
+    kept_norms = []
+    for q in questions:
+        match = find_near_duplicate(q["question_text"], kept_norms, threshold=threshold)
+        if match:
+            continue
+        kept.append(q)
+        kept_norms.append((q.get("id"), _normalize_text(q["question_text"])))
+    return kept
+
+
 def deduplicate_certification(
     cert_id: int, threshold: float = DUPLICATE_SIMILARITY_THRESHOLD, db_path: str = DB_PATH
 ) -> dict:
     """
     Scan every question already banked under a certification and remove near-duplicates,
-    keeping the earliest-inserted copy of each group. Returns:
+    keeping the earliest-inserted copy of each group. Comparisons are scoped within each
+    language separately (an English and a Japanese question are never considered
+    duplicates of each other, regardless of topic overlap). Returns:
         {"removed": n, "kept": n, "removed_ids": [...]}
     """
     with get_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT id, question_text FROM questions WHERE cert_id = ? ORDER BY id ASC", (cert_id,)
+            "SELECT id, question_text, language FROM questions WHERE cert_id = ? ORDER BY id ASC", (cert_id,)
         ).fetchall()
 
-    kept: list = []
+    kept_by_language: dict = {}
     removed_ids = []
     for row in rows:
-        match = find_near_duplicate(row["question_text"], kept, threshold=threshold)
+        lang = row["language"] or "en"
+        kept_for_lang = kept_by_language.setdefault(lang, [])
+        match = find_near_duplicate(row["question_text"], kept_for_lang, threshold=threshold)
         if match:
             removed_ids.append(row["id"])
         else:
-            kept.append((row["id"], _normalize_text(row["question_text"])))
+            kept_for_lang.append((row["id"], _normalize_text(row["question_text"])))
+
+    total_kept = sum(len(v) for v in kept_by_language.values())
 
     if removed_ids:
         with get_connection(db_path) as conn:
             conn.executemany("DELETE FROM questions WHERE id = ?", [(i,) for i in removed_ids])
 
-    return {"removed": len(removed_ids), "kept": len(kept), "removed_ids": removed_ids}
+    return {"removed": len(removed_ids), "kept": total_kept, "removed_ids": removed_ids}
 
 
 def deduplicate_all_certifications(
@@ -192,6 +249,7 @@ def init_schema(db_path: str = DB_PATH) -> None:
                 correct_option  TEXT NOT NULL CHECK (correct_option IN ('A','B','C','D')),
                 explanation     TEXT NOT NULL,
                 domain          TEXT,                          -- optional exam-domain tag
+                language        TEXT NOT NULL DEFAULT 'en',    -- 'en' | 'ja' — UI language this question is written in
                 FOREIGN KEY (cert_id) REFERENCES certifications(id) ON DELETE CASCADE
             );
 
@@ -206,6 +264,17 @@ def init_schema(db_path: str = DB_PATH) -> None:
             "WHERE total_questions_per_exam < ?",
             (MAX_QUESTIONS_PER_CERT, MAX_QUESTIONS_PER_CERT),
         )
+        # Migration for databases created before the `language` column existed:
+        # add it (SQLite requires ALTER TABLE for this on older schemas) and
+        # backfill every pre-existing row as 'en', since all prior content was
+        # written in English. This must run BEFORE creating any index that
+        # references the column, since CREATE TABLE IF NOT EXISTS above is a
+        # no-op on a table that already exists without it.
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(questions)").fetchall()}
+        if "language" not in existing_columns:
+            conn.execute("ALTER TABLE questions ADD COLUMN language TEXT NOT NULL DEFAULT 'en'")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_questions_cert_lang ON questions(cert_id, language)")
 
 
 def seed_certifications(db_path: str = DB_PATH) -> None:
@@ -279,22 +348,36 @@ def get_certification_by_code(code: str, db_path: str = DB_PATH) -> Optional[sql
         ).fetchone()
 
 
-def get_question_count(cert_id: int, db_path: str = DB_PATH) -> int:
-    """Total number of questions banked for a certification (across all exam sets)."""
+def get_question_count(cert_id: int, db_path: str = DB_PATH, language: Optional[str] = None) -> int:
+    """
+    Number of questions banked for a certification (across all exam sets).
+    If `language` is given, counts only questions in that language — the 500-question
+    cap and exam-sampling pool size are tracked per (certification, language), so
+    adding English questions never eats into a certification's Japanese capacity or
+    vice versa.
+    """
     with get_connection(db_path) as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM questions WHERE cert_id = ?", (cert_id,)
-        ).fetchone()
+        if language:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM questions WHERE cert_id = ? AND language = ?",
+                (cert_id, language),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM questions WHERE cert_id = ?", (cert_id,)
+            ).fetchone()
         return row["cnt"] if row else 0
 
 
 def get_question_counts_all(db_path: str = DB_PATH) -> list[dict]:
-    """Question counts per certification, for the admin dashboard summary table."""
+    """Question counts per certification (with an en/ja breakdown), for the admin dashboard."""
     with get_connection(db_path) as conn:
         rows = conn.execute(
             """
             SELECT c.id, c.code, c.name, c.level, c.total_questions_per_exam AS cap,
-                   COUNT(q.id) AS question_count
+                   COUNT(q.id) AS question_count,
+                   SUM(CASE WHEN q.language = 'en' THEN 1 ELSE 0 END) AS en_count,
+                   SUM(CASE WHEN q.language = 'ja' THEN 1 ELSE 0 END) AS ja_count
             FROM certifications c
             LEFT JOIN questions q ON q.cert_id = c.id
             GROUP BY c.id
@@ -304,19 +387,48 @@ def get_question_counts_all(db_path: str = DB_PATH) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def get_random_questions(cert_id: int, limit: int, db_path: str = DB_PATH) -> list[dict]:
-    """Fetch a random sample of `limit` questions for a given certification."""
+def get_random_questions(cert_id: int, limit: int, db_path: str = DB_PATH, language: Optional[str] = None) -> list[dict]:
+    """
+    Fetch a random sample of up to `limit` questions for a given certification.
+
+    If `language` is given ('en' or 'ja'), only questions written in that language are
+    considered — this is how the exam-taking flow guarantees a learner using the
+    Japanese UI is never served an English question (or vice versa).
+
+    Guarantees that no two questions in the returned set are near-duplicates of each
+    other (>= EXAM_DEDUP_THRESHOLD similar), even if such pairs exist elsewhere in the
+    certification's overall bank — e.g. legacy data from before deduplication existed,
+    or bulk imports/generations where the storage-level similarity threshold was
+    intentionally relaxed to 100% to allow duplicates in. This guarantee always
+    applies to exam sampling, independent of whatever threshold was used when the
+    questions were stored, and is not user-configurable.
+
+    If the certification's deduped pool has fewer than `limit` sufficiently distinct
+    questions, returns as many as it safely can rather than padding with duplicates.
+    """
     with get_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM questions
-            WHERE cert_id = ?
-            ORDER BY RANDOM()
-            LIMIT ?
-            """,
-            (cert_id, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        if language:
+            rows = conn.execute(
+                "SELECT * FROM questions WHERE cert_id = ? AND language = ? ORDER BY RANDOM()",
+                (cert_id, language),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM questions WHERE cert_id = ? ORDER BY RANDOM()",
+                (cert_id,),
+            ).fetchall()
+
+    selected = []
+    selected_norms = []
+    for row in rows:
+        if len(selected) >= limit:
+            break
+        q = dict(row)
+        if find_near_duplicate(q["question_text"], selected_norms, threshold=EXAM_DEDUP_THRESHOLD):
+            continue  # too similar to a question already picked for this exam attempt
+        selected.append(q)
+        selected_norms.append((q["id"], _normalize_text(q["question_text"])))
+    return selected
 
 
 def add_question(
@@ -330,6 +442,7 @@ def add_question(
     explanation: str,
     exam_number: int = 1,
     domain: Optional[str] = None,
+    language: str = "en",
     db_path: str = DB_PATH,
     check_duplicates: bool = True,
     similarity_threshold: float = DUPLICATE_SIMILARITY_THRESHOLD,
@@ -338,9 +451,13 @@ def add_question(
     """
     Insert a single question. Returns the new row id.
 
+    `language` ('en' or 'ja') records which UI language this question's text is written
+    in, so exam sampling can serve only questions matching the learner's selected
+    language.
+
     Raises ValueError on invalid input, or DuplicateQuestionError (a ValueError subclass)
     if `check_duplicates` is True and the question is >= `similarity_threshold` similar to
-    an already-banked question for the same certification.
+    an already-banked question in the SAME language for the same certification.
 
     `existing_texts`, if provided, is a mutable [(id, normalized_text), ...] cache used
     instead of re-querying the database — callers doing many inserts in a row (batch
@@ -352,10 +469,11 @@ def add_question(
         raise ValueError(f"correct_option must be one of A/B/C/D, got '{correct_option}'")
     if not all([question_text, option_a, option_b, option_c, option_d, explanation]):
         raise ValueError("All question fields (text, 4 options, explanation) are required.")
+    language = (language or "en").strip().lower()
 
     if check_duplicates:
         candidates = existing_texts if existing_texts is not None else _load_existing_normalized_texts(
-            cert_id, db_path=db_path
+            cert_id, db_path=db_path, language=language
         )
         match = find_near_duplicate(question_text, candidates, threshold=similarity_threshold)
         if match:
@@ -371,12 +489,12 @@ def add_question(
             """
             INSERT INTO questions
                 (cert_id, exam_number, question_text, option_a, option_b, option_c, option_d,
-                 correct_option, explanation, domain)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 correct_option, explanation, domain, language)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 cert_id, exam_number, question_text, option_a, option_b, option_c, option_d,
-                correct_option, explanation, domain,
+                correct_option, explanation, domain, language,
             ),
         )
         new_id = cur.lastrowid
@@ -387,24 +505,39 @@ def add_question(
     return new_id
 
 
-def batch_import_questions(cert_id: int, records: list[dict], db_path: str = DB_PATH) -> dict:
+def batch_import_questions(
+    cert_id: int, records: list[dict], db_path: str = DB_PATH,
+    similarity_threshold: float = DUPLICATE_SIMILARITY_THRESHOLD,
+    default_language: str = "en",
+) -> dict:
     """
     Batch-insert questions from a list of dicts (already parsed from CSV/JSON), rejecting
-    any record that's a near-duplicate (>= DUPLICATE_SIMILARITY_THRESHOLD similar) of an
-    already-banked question or of an earlier record in this same import.
+    any record that's a near-duplicate (>= `similarity_threshold` similar) of an
+    already-banked question in the same language, or of an earlier record in this same
+    import. Pass 1.0 (100%) to disable the check entirely and allow complete duplicates
+    through.
+
+    Each record may include its own `language` field ('en' or 'ja'); records without one
+    use `default_language`. This lets a single import mix languages if needed, while
+    keeping duplicate-detection scoped correctly within each language.
 
     Returns: {"inserted": n, "duplicates_skipped": n, "errors": ["row 3: reason", ...]}
     """
     inserted = 0
     duplicates_skipped = 0
     errors = []
-    existing_texts = _load_existing_normalized_texts(cert_id, db_path=db_path)
+    existing_texts_by_lang: dict = {}
 
     for i, rec in enumerate(records, start=1):
         try:
             missing = [f for f in REQUIRED_QUESTION_FIELDS if not str(rec.get(f, "")).strip()]
             if missing:
                 raise ValueError(f"missing field(s): {', '.join(missing)}")
+            language = str(rec.get("language") or default_language).strip().lower()
+            if language not in existing_texts_by_lang:
+                existing_texts_by_lang[language] = _load_existing_normalized_texts(
+                    cert_id, db_path=db_path, language=language
+                )
             add_question(
                 cert_id=cert_id,
                 question_text=str(rec["question_text"]).strip(),
@@ -416,8 +549,10 @@ def batch_import_questions(cert_id: int, records: list[dict], db_path: str = DB_
                 explanation=str(rec["explanation"]).strip(),
                 exam_number=int(rec.get("exam_number", 1) or 1),
                 domain=rec.get("domain"),
+                language=language,
                 db_path=db_path,
-                existing_texts=existing_texts,
+                existing_texts=existing_texts_by_lang[language],
+                similarity_threshold=similarity_threshold,
             )
             inserted += 1
         except DuplicateQuestionError as exc:
@@ -467,14 +602,27 @@ def is_ai_generation_available(provider: str = ai_providers.PROVIDER_ANTHROPIC,
     return ai_providers.is_provider_configured(provider, base_url=base_url, api_key=api_key)
 
 
-def _existing_question_signatures(cert_id: int, db_path: str = DB_PATH) -> set:
+# Human-readable names used inside the generation prompt (kept independent of the
+# UI-facing i18n module so db_utils has no dependency on the Streamlit layer).
+LANGUAGE_NAMES_FOR_PROMPT = {"en": "English", "ja": "Japanese (日本語)"}
+
+
+def _existing_question_signatures(cert_id: int, db_path: str = DB_PATH, language: Optional[str] = None) -> set:
     """Lightweight signatures (lowercased, truncated) used only to nudge the model's prompt
     away from stems it's already produced — the actual duplicate *rejection* is handled by
-    find_near_duplicate()/add_question(), which does a real similarity comparison."""
+    find_near_duplicate()/add_question(), which does a real similarity comparison. Scoped
+    to `language` so, e.g., a Japanese generation run isn't shown English stems (which
+    would just be noise for a model asked to write in Japanese)."""
     with get_connection(db_path) as conn:
-        rows = conn.execute(
-            "SELECT question_text FROM questions WHERE cert_id = ?", (cert_id,)
-        ).fetchall()
+        if language:
+            rows = conn.execute(
+                "SELECT question_text FROM questions WHERE cert_id = ? AND language = ?",
+                (cert_id, language),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT question_text FROM questions WHERE cert_id = ?", (cert_id,)
+            ).fetchall()
         return {r["question_text"].strip().lower()[:80] for r in rows}
 
 
@@ -483,6 +631,10 @@ _GENERATION_PROMPT_TEMPLATE = """You are an expert AWS certification exam item-w
 Generate {batch_size} unique, realistic, scenario-based multiple-choice practice questions
 for the "{cert_name}" ({cert_code}) certification exam, at the difficulty level of the real
 exam. Cover a healthy variety of exam domains/topics; do not repeat the same scenario twice.
+
+Write the question text, all four answer options, and the explanation ENTIRELY in
+{language_name}. Do not mix languages within a single question — every field for every
+question must be in {language_name} only.
 
 Avoid writing questions that closely resemble any of these already-banked question stems
 (do not reuse these scenarios or near-duplicates of them):
@@ -529,17 +681,22 @@ def generate_questions_with_ai(
     progress_callback=None,
     db_path: str = DB_PATH,
     similarity_threshold: float = DUPLICATE_SIMILARITY_THRESHOLD,
+    language: str = "en",
 ) -> dict:
     """
     Dynamically generate up to `num_questions` new questions for `cert` using the selected
     model provider (Anthropic Cloud API, a local Ollama instance, or a local Open WebUI
     instance) and persist them to the local SQLite question bank (capped at
-    MAX_QUESTIONS_PER_CERT total per certification).
+    MAX_QUESTIONS_PER_CERT questions per certification PER LANGUAGE).
+
+    `language` ('en' or 'ja') is passed to the model as an explicit instruction to write
+    every field of every generated question in that language, and is stored on each
+    inserted row so exam sampling can later filter to just that language.
 
     Every candidate question is checked for near-duplication (>= `similarity_threshold`
-    similarity via difflib) against both the existing bank and everything already inserted
-    earlier in this same generation run, so the model repeating itself within or across
-    batches doesn't slip duplicates into the database.
+    similarity via difflib) against both the existing same-language bank and everything
+    already inserted earlier in this same generation run, so the model repeating itself
+    within or across batches doesn't slip duplicates into the database.
 
     `progress_callback`, if provided, is called after each batch with (completed, total).
 
@@ -555,7 +712,10 @@ def generate_questions_with_ai(
             "(API key / base URL) and try again."
         )
 
-    current_count = get_question_count(cert["id"], db_path=db_path)
+    language = (language or "en").strip().lower()
+    language_name = LANGUAGE_NAMES_FOR_PROMPT.get(language, "English")
+
+    current_count = get_question_count(cert["id"], db_path=db_path, language=language)
     room_available = max(0, MAX_QUESTIONS_PER_CERT - current_count)
     target = min(num_questions, room_available)
 
@@ -564,8 +724,11 @@ def generate_questions_with_ai(
     errors = []
     batches_run = 0
     inserted_questions = []
-    prompt_hint_stems = _existing_question_signatures(cert["id"], db_path=db_path)  # for prompt diversity nudging only
-    existing_texts = _load_existing_normalized_texts(cert["id"], db_path=db_path)   # authoritative dedup cache
+    # Both scoped to `language`: showing a Japanese generation run English stems (or
+    # vice versa) would just be noise, and dedup across languages is meaningless since
+    # the text will always differ.
+    prompt_hint_stems = _existing_question_signatures(cert["id"], db_path=db_path, language=language)
+    existing_texts = _load_existing_normalized_texts(cert["id"], db_path=db_path, language=language)
 
     remaining = target
     while remaining > 0:
@@ -576,6 +739,7 @@ def generate_questions_with_ai(
             cert_name=cert["name"],
             cert_code=cert["code"],
             existing_stems=existing_stems,
+            language_name=language_name,
         )
 
         try:
@@ -612,6 +776,7 @@ def generate_questions_with_ai(
                     explanation=str(rec["explanation"]).strip(),
                     exam_number=exam_number,
                     domain=rec.get("domain"),
+                    language=language,
                     db_path=db_path,
                     existing_texts=existing_texts,
                     similarity_threshold=similarity_threshold,

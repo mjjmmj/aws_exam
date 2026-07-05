@@ -85,6 +85,27 @@ def render_language_selector():
 # --------------------------------------------------------------------------
 # Shared AI provider/model configuration widget
 # --------------------------------------------------------------------------
+def render_similarity_threshold_slider(key_prefix: str, default: float = None) -> float:
+    """
+    Shared slider for the duplicate-similarity threshold used when importing or
+    generating questions. Returns a 0.0-1.0 fraction. 1.0 (100%) disables duplicate
+    detection entirely for that operation, keeping even complete duplicates.
+    """
+    default_pct = int((default if default is not None else db_utils.DUPLICATE_SIMILARITY_THRESHOLD) * 100)
+    pct = st.slider(
+        t("similarity_threshold_label"),
+        min_value=int(db_utils.MIN_SIMILARITY_THRESHOLD * 100),
+        max_value=int(db_utils.MAX_SIMILARITY_THRESHOLD * 100),
+        value=default_pct,
+        step=1,
+        key=f"{key_prefix}_similarity_threshold",
+        help=t("similarity_threshold_help"),
+    )
+    if pct >= 100:
+        st.caption(t("similarity_100_note"))
+    return pct / 100.0
+
+
 def render_ai_provider_selector(key_prefix: str):
     """
     Renders provider/base-URL/API-key/model widgets. Selections are persisted in
@@ -178,13 +199,22 @@ def start_exam(cert_row, num_questions: int, timed_mode: bool, time_limit_minute
     """
     Begin a new exam attempt.
 
-    If `explicit_questions` is provided (e.g. a freshly AI-generated set), those exact
-    questions are used for this attempt. Otherwise, `num_questions` are sampled randomly
-    from the existing question bank for `cert_row`.
+    If `explicit_questions` is provided (e.g. a freshly AI-generated set), those
+    questions are used for this attempt — after one final duplicate-safety pass, since
+    the storage-level similarity threshold used to generate them may have been
+    intentionally relaxed (even to 100% / "keep complete duplicates") for the question
+    bank itself. An exam must never repeat a question regardless of that setting.
+    Otherwise, `num_questions` are sampled randomly from the existing question bank for
+    `cert_row`, restricted to the currently selected UI language (st.session_state.language)
+    so a learner using the Japanese UI is never served an English question, or vice versa.
     """
-    questions = explicit_questions if explicit_questions is not None else db_utils.get_random_questions(
-        cert_row["id"], num_questions
-    )
+    if explicit_questions is not None:
+        deduped = db_utils.deduplicate_question_list(list(explicit_questions))
+        questions = deduped
+    else:
+        questions = db_utils.get_random_questions(
+            cert_row["id"], num_questions, language=st.session_state.language
+        )
     questions = list(questions)
     random.shuffle(questions)
     st.session_state.exam_questions = questions
@@ -280,7 +310,7 @@ def render_exam_config_sidebar():
         disabled=st.session_state.exam_stage == "in_progress",
     )
     selected_cert = dict(cert_lookup[selected_label])
-    pool_size = db_utils.get_question_count(selected_cert["id"])
+    pool_size = db_utils.get_question_count(selected_cert["id"], language=st.session_state.language)
 
     st.sidebar.caption(t("level_pass_mark", level=selected_cert["level"], pct=int(selected_cert["pass_threshold"]*100)))
     st.sidebar.caption(t("questions_in_bank", count=pool_size))
@@ -300,10 +330,11 @@ def render_exam_config_sidebar():
     ai_provider = ai_model = ai_base_url = ai_api_key = None
     ai_custom_path = ""
     ai_exam_number = 1
+    examgen_similarity_threshold = db_utils.DUPLICATE_SIMILARITY_THRESHOLD
 
     if not use_ai_generation:
         if pool_size == 0:
-            st.sidebar.error(t("no_questions_yet"))
+            st.sidebar.error(t("no_questions_yet_lang", language=LANGUAGES.get(st.session_state.language, st.session_state.language)))
             return
         max_q = min(pool_size, db_utils.MAX_QUESTIONS_PER_CERT)
         if max_q <= 1:
@@ -324,6 +355,7 @@ def render_exam_config_sidebar():
         st.sidebar.caption(t("ai_gen_intro"))
         with st.sidebar.expander(t("model_provider_settings"), expanded=True):
             ai_provider, ai_model, ai_base_url, ai_api_key, ai_custom_path = render_ai_provider_selector("examgen")
+            examgen_similarity_threshold = render_similarity_threshold_slider("examgen")
 
         room_left = max(0, db_utils.MAX_QUESTIONS_PER_CERT - pool_size)
         if room_left == 0:
@@ -387,6 +419,8 @@ def render_exam_config_sidebar():
                         custom_path=ai_custom_path,
                         exam_number=int(ai_exam_number),
                         progress_callback=_update_progress,
+                        similarity_threshold=examgen_similarity_threshold,
+                        language=st.session_state.language,
                     )
                 if not result["inserted_questions"]:
                     err_preview = "; ".join(result["errors"][:2]) or t("no_questions_returned")
@@ -591,6 +625,8 @@ def render_admin_dashboard():
                     "name": t("col_certification"),
                     "level": t("col_level"),
                     "question_count": t("col_question_count"),
+                    "en_count": t("col_en_count"),
+                    "ja_count": t("col_ja_count"),
                     "cap": t("col_max_bank_size"),
                 },
                 hide_index=True,
@@ -599,9 +635,10 @@ def render_admin_dashboard():
             st.divider()
             st.subheader(t("dedup_header"))
             st.caption(t("dedup_caption", pct=int(db_utils.DUPLICATE_SIMILARITY_THRESHOLD*100)))
+            dedup_similarity_threshold = render_similarity_threshold_slider("cleanup_dedup")
             if st.button(t("dedup_button")):
                 with st.spinner(t("dedup_scanning")):
-                    results = db_utils.deduplicate_all_certifications()
+                    results = db_utils.deduplicate_all_certifications(threshold=dedup_similarity_threshold)
                 total_removed = sum(r["removed"] for r in results.values())
                 if total_removed == 0:
                     st.success(t("dedup_none_found"))
@@ -624,6 +661,14 @@ def render_admin_dashboard():
 
             with st.form("add_question_form", clear_on_submit=True):
                 cert_label = st.selectbox(t("certification_label"), cert_labels)
+                lang_codes = list(LANGUAGES.keys())
+                lang_labels = list(LANGUAGES.values())
+                default_lang_idx = lang_codes.index(st.session_state.language) if st.session_state.language in lang_codes else 0
+                question_lang_label = st.selectbox(
+                    t("question_language_label"), lang_labels, index=default_lang_idx,
+                    help=t("question_language_help"),
+                )
+                question_language = lang_codes[lang_labels.index(question_lang_label)]
                 exam_number = st.number_input(
                     t("exam_set_label"), min_value=1, max_value=10, value=1,
                     help=t("exam_set_help"),
@@ -656,6 +701,7 @@ def render_admin_dashboard():
                         explanation=explanation.strip(),
                         exam_number=int(exam_number),
                         domain=domain.strip() or None,
+                        language=question_language,
                     )
                     st.success(t("question_added_success", code=cert["code"], exam_number=exam_number))
                 except ValueError as e:
@@ -673,6 +719,17 @@ def render_admin_dashboard():
             target_label = st.selectbox(t("target_cert_import_label"), cert_labels, key="batch_cert")
             target_cert = cert_lookup[target_label]
 
+            lang_codes = list(LANGUAGES.keys())
+            lang_labels = list(LANGUAGES.values())
+            default_lang_idx = lang_codes.index(st.session_state.language) if st.session_state.language in lang_codes else 0
+            batch_lang_label = st.selectbox(
+                t("default_language_label"), lang_labels, index=default_lang_idx,
+                help=t("default_language_help"),
+            )
+            batch_default_language = lang_codes[lang_labels.index(batch_lang_label)]
+
+            batch_similarity_threshold = render_similarity_threshold_slider("batch_import")
+
             uploaded_file = st.file_uploader(t("upload_file_label"), type=["csv", "json"])
 
             if uploaded_file is not None:
@@ -683,13 +740,16 @@ def render_admin_dashboard():
                     st.caption(t("preview_first_5"))
 
                     if st.button(t("confirm_import_button"), type="primary"):
-                        result = db_utils.batch_import_questions(target_cert["id"], records)
+                        result = db_utils.batch_import_questions(
+                            target_cert["id"], records, similarity_threshold=batch_similarity_threshold,
+                            default_language=batch_default_language,
+                        )
                         st.success(t("imported_success", count=result["inserted"], code=target_cert["code"]))
                         if result.get("duplicates_skipped"):
                             st.info(
                                 t("skipped_duplicates_info",
                                   count=result["duplicates_skipped"],
-                                  pct=int(db_utils.DUPLICATE_SIMILARITY_THRESHOLD*100))
+                                  pct=int(batch_similarity_threshold*100))
                             )
                         other_errors = [e for e in result["errors"] if "near-duplicate" not in e]
                         if other_errors:
@@ -715,7 +775,16 @@ def render_admin_dashboard():
             gen_label = st.selectbox(t("certification_label"), cert_labels, key="ai_gen_cert")
             gen_cert = dict(cert_lookup[gen_label])
 
-            current_count = db_utils.get_question_count(gen_cert["id"])
+            lang_codes = list(LANGUAGES.keys())
+            lang_labels = list(LANGUAGES.values())
+            default_lang_idx = lang_codes.index(st.session_state.language) if st.session_state.language in lang_codes else 0
+            gen_lang_label = st.selectbox(
+                t("question_language_label"), lang_labels, index=default_lang_idx,
+                help=t("question_language_help"), key="ai_gen_language",
+            )
+            gen_language = lang_codes[lang_labels.index(gen_lang_label)]
+
+            current_count = db_utils.get_question_count(gen_cert["id"], language=gen_language)
             room_left = max(0, db_utils.MAX_QUESTIONS_PER_CERT - current_count)
             st.caption(t("bank_size_caption", current=current_count, cap=db_utils.MAX_QUESTIONS_PER_CERT, room=room_left))
 
@@ -730,6 +799,8 @@ def render_admin_dashboard():
                     t("batch_size_label"), [5, 10, 15, 20], index=1,
                     help=t("batch_size_help"),
                 )
+
+            gen_similarity_threshold = render_similarity_threshold_slider("admin_gen")
 
             if room_left == 0:
                 st.info(t("bank_already_full"))
@@ -764,6 +835,8 @@ def render_admin_dashboard():
                                     exam_number=int(exam_number),
                                     batch_size=int(batch_size),
                                     progress_callback=_update_progress,
+                                    similarity_threshold=gen_similarity_threshold,
+                                    language=gen_language,
                                 )
                                 progress_bar.progress(1.0, text=t("done_progress"))
                                 st.success(

@@ -258,8 +258,8 @@ def seed_sample_questions(db_path: str = db_utils.DB_PATH) -> None:
                 """
                 INSERT INTO questions
                     (cert_id, exam_number, question_text, option_a, option_b, option_c, option_d,
-                     correct_option, explanation, domain)
-                VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                     correct_option, explanation, domain, language)
+                VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'en')
                 """,
                 (
                     cert["id"], q["question_text"], q["option_a"], q["option_b"],
